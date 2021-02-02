@@ -15,12 +15,13 @@ import numpy as np
 # %% load models
 # M. florum
 model = cobra.io.load_json_model(join(abspath("..\Tutorials"), "final_iJL208_28_07_2020.json"))
+model_original = model.copy()
 model_a = model.copy() # augmented with E. coli reactions/genes
 # E. coli iML1515
 iML1515 = cobra.io.load_json_model("iML1515.json")
 
 # enforce growth
-model_a.reactions.get_by_id("BIOMASS_step3_c").lower_bound = 0.1
+# model_a.reactions.get_by_id("BIOMASS_step3_c").lower_bound = 0.1
 # lift secretion bounds
 model_a.reactions.get_by_id("EX_ac_e").bounds = (0, 1000)
 model_a.reactions.get_by_id("EX_lac__L_e").bounds = (0, 1000)
@@ -35,23 +36,25 @@ model_a.reactions.get_by_id("EX_lac__L_e").bounds = (0, 1000)
 # %% user parameter
 filename = "AA_iModulon_in_iJL208_minimal_yield.xlsx"
 
+bio = "BIOMASS_step3_c"     # biomass formation equation ID
+
+add_transport_reactions = True # add transport/exchange reactions for non-native metabolites introduced
+
 id_prefix_ecoli = "_ecoli"     # denotes reactions from iML1515 in iJL208
 id_prefix_iMod = "_iMod"     # denotes iModulon reactions
 # mode for determining set of heterologous reaction towards iModulons
 mode = "min_yield" # "max_yield": Maximize AA yield/flux; "min_yield": Guarantee a minimal AA yield
-AA_min_flux = 0.05 # minimal AA synthesis flux relative to maximum flux
-bio_min_flux = 0.05
-bio = "BIOMASS_step3_c"
+bio_min_flux = 0.05 # minimal growth rate relative to maximum growth(~0.22 1/h)
 
 
 # amino acids
-AA = ["gly", "arg__L", "ala__L", "leu__L", "thr__L", "arg__L", "asn__L", "glu__L",
+AA_IDs = ["gly", "arg__L", "ala__L", "leu__L", "thr__L", "arg__L", "asn__L", "glu__L",
       "asp__L", "gln__L", "his__L", "ile__L", "lys__L", "met__L", "phe__L", "ser__L",
       "trp__L", "tyr__L", "val__L", "cys__L"]
 
 # %% restrict carbon uptake reactions
 # determine flux distribution
-bound_factor = 2 # bounds on exchange flux based on WT flux distribution times this factor
+bound_factor = 1 # bounds on exchange flux based on WT flux distribution times this factor
 sol_wt = model.optimize()
 for ex_rxn in model.exchanges:
     if len(ex_rxn.reactants) == 1:
@@ -147,6 +150,33 @@ def add_iModulon_to_model(model, g_data, iMod):
     # mark iModulon reactions in M. florum model
     iMod_rxns = []
     for iMod_rxn in iMod_rxns_unique:
+        
+        # add exchange reaction (secretion only) for novel, non-native metabolites
+        if add_transport_reactions:
+            for met in iMod_rxn.metabolites:
+                try:
+                    model_original.metabolites.get_by_id(met.id)
+                    # metabolite already in original iJL208, do nothing
+                except:
+                    # metabolite not in model, add secretion reaction
+                    scrt_rxn_id = "EX_" + met.id
+                    scrt_rxn = cobra.Reaction(id=scrt_rxn_id,
+                                              lower_bound=0,
+                                              upper_bound=1000)
+                    # check if metabolite was introduced by other heterologous reactions
+                    try:
+                        scrt_met = model.metabolites.get_by_id(met.id)
+                    except:                        
+                        scrt_met = cobra.Metabolite(id=met.id,
+                                                formula=met.formula,
+                                                name=met.name,
+                                                charge=met.charge,
+                                                compartment=met.compartment)
+                    
+                    scrt_rxn.add_metabolites({scrt_met: -1})
+                    model.add_reaction(scrt_rxn)
+                        
+        
         try:
             rxn = model.reactions.get_by_id(iMod_rxn.id + id_prefix_ecoli)
             # switch reactions to savely change id
@@ -159,11 +189,28 @@ def add_iModulon_to_model(model, g_data, iMod):
             rxn_id_change = create_rxn_from_object(iMod_rxn.id + id_prefix_iMod, iMod_rxn)
             model.add_reaction(rxn_id_change)
 
-        iMod_rxns.append(rxn_id_change.id)     
+        iMod_rxns.append(rxn_id_change.id)
+        
+        
+        
+        
     return iMod_rxns
      
     
-
+def disable_amino_acid_uptake(model, amino_acid):
+    # disable amino acid uptake (or respective di-peptide)
+    for ex_rxn in model.exchanges:
+        if amino_acid in ex_rxn.id:
+            ex_rxn.bounds = (0, 0)
+            
+        # consider misspelling of ala__L in di-peptide
+        if amino_acid == "ala__L":
+            if "ala_L" in ex_rxn.id:
+                ex_rxn.bounds = (0, 0)
+                
+    return model
+                
+    
 
 # %% integrate iModulon genes in model
 iMod_models = {}
@@ -183,7 +230,7 @@ for iMod in iMod_names:
         for iMod_rxn_id in iMod_rxns:
             iMod_rxn = model_a.reactions.get_by_id(iMod_rxn_id)
             for met, stoic in iMod_rxn.metabolites.items():
-                if met.id[:-2] in AA and met.id not in AA_synthesis and met.id[-2:]=="_c":
+                if met.id[:-2] in AA_IDs and met.id not in AA_synthesis and met.id[-2:]=="_c":
                     if stoic < 0 and iMod_rxn.lower_bound < 0:
                         AA_synthesis.append(met.id)
                     elif stoic > 0 and iMod_rxn.upper_bound > 0:
@@ -205,16 +252,18 @@ for iMod in iMod_names:
                         model_a.reactions.get_by_id(aa_rxn.id).bounds = (0, 0)
                         pass
                         
-                # disable amino acid uptake (or respective di-peptide)
-                for ex_rxn in model_a.exchanges:
-                    if AA_syn[:-2] in ex_rxn.id:
-                        ex_rxn.bounds = (0, 0)
-                        pass
-                    # consider misspelling of ala__L in di-peptide
-                    if AA_syn[:-2] == "ala__L":
-                        if "ala_L" in ex_rxn.id:
-                            ex_rxn.bounds = (0, 0)
-                            pass
+                # disable amino acid uptake (or respective di-peptide)     
+                model_a = disable_amino_acid_uptake(model_a, AA_syn[:-2])
+                # # disable amino acid uptake (or respective di-peptide)
+                # for ex_rxn in model_a.exchanges:
+                #     if AA_syn[:-2] in ex_rxn.id:
+                #         ex_rxn.bounds = (0, 0)
+                #         pass
+                #     # consider misspelling of ala__L in di-peptide
+                #     if AA_syn[:-2] == "ala__L":
+                #         if "ala_L" in ex_rxn.id:
+                #             ex_rxn.bounds = (0, 0)
+                #             pass
                   
                            
                   
@@ -316,10 +365,15 @@ for iMod in iMod_names:
         
         
 # %% Analyze solutions
-iMod_res = pd.DataFrame(columns=["iModulon", "Amino acid", "E. coli connect reactions", 
+iMod_res = pd.DataFrame(columns=["iModulon",
+                                 "Amino acid",
+                                 "E. coli connect reactions", 
                                  "E. coli connect reaction fluxes",
                                  "E.coli connect genes", "E. coli connect subsystems",
-                                 "Amino acid synthesis rate [mmol/gDW/h]"])
+                                 "Amino acid synthesis rate [mmol/gDW/h]",
+                                 "Maximum growth rate [1/h]",
+                                 "Amino acid co-synthesis",
+                                 "Amino acid co-synthesis growth [1/h]"])
 
 # loop through solutions
 c = 0
@@ -345,7 +399,7 @@ for iMod in iMod_AA_solutions.items():
                 # save reaction ID
                 ecoli_rxns.append(ecoli_id)
                 # save flux
-                ecoli_rxns_flux.append(str(sol.fluxes[f]))
+                ecoli_rxns_flux.append(str(round(sol.fluxes[f], 4)))
                 # save subsystem
                 ecoli_subsystems.append(iML1515.reactions.get_by_id(ecoli_id).subsystem)
                 # save related genes
@@ -362,13 +416,14 @@ for iMod in iMod_AA_solutions.items():
         
 
 
-# %% check essentiality of E. coli reactions
+# %% check essentiality of E. coli reactions and producce simulation data for minimal reaction sets
 
 writer = pd.ExcelWriter(filename, engine="xlsxwriter")
 
 obj_val = []
 essential_reactions = {}
 iMod_info_save = {}
+max_growth_solutions = {}
 for i, iMod_AA in iMod_res.iterrows():
     
     # get heterologous E. coli reactions to connect iModulon
@@ -380,16 +435,18 @@ for i, iMod_AA in iMod_res.iterrows():
         # add iModulon
         iMod_rxns_unique = add_iModulon_to_model(model_p, g_data, iMod_AA["iModulon"])
         
+        # disable amino acid uptake (or respective di-peptide)     
+        model_p = disable_amino_acid_uptake(model_p, AA_syn[:-2])
         # disable amino acid uptake (or respective di-peptide)
-        for ex_rxn in model_p.exchanges:
-            if AA_syn[:-2] in ex_rxn.id:
-                ex_rxn.bounds = (0, 0)
-                pass
-            # consider misspelling of ala__L in di-peptide
-            if AA_syn[:-2] == "ala__L":
-                if "ala_L" in ex_rxn.id:
-                    ex_rxn.bounds = (0, 0)
-                    pass
+        # for ex_rxn in model_p.exchanges:
+        #     if AA_syn[:-2] in ex_rxn.id:
+        #         ex_rxn.bounds = (0, 0)
+        #         pass
+        #     # consider misspelling of ala__L in di-peptide
+        #     if AA_syn[:-2] == "ala__L":
+        #         if "ala_L" in ex_rxn.id:
+        #             ex_rxn.bounds = (0, 0)
+        #             pass
          
         # create amino acid exchange
         aa_met = model_p.metabolites.get_by_id(AA_syn)
@@ -414,6 +471,7 @@ for i, iMod_AA in iMod_res.iterrows():
             
         
         # test essentiality of E. coli reactions
+        model_p.reactions.get_by_id(bio).lower_bound = growth_WT*bio_min_flux   # enforce biomass formation
         model_p.objective = ex_aa_id
         is_essential = []
         dict_key = iMod_AA["iModulon"] + "; " + AA_syn
@@ -436,9 +494,37 @@ for i, iMod_AA in iMod_res.iterrows():
             # restore reaction bounds
             model_p.reactions.get_by_id(ecoli_rxn).bounds = bounds_save
             
+        model_p.reactions.get_by_id(bio).lower_bound = 0   # relax biomass formation  constraints gain 
+            
+        
         # get maximum flux towards AA
-        sol = model_p.optimize()
+        sol_max_aa = model_p.optimize()
+        
+        # calculate maximum growth rate
+        model_p.objective = bio
+        model_p.reactions.get_by_id(bio).lower_bound = 0
+        model_p.reactions.get_by_id(bio).upper_bound = 1000
+        sol_max_mu = model_p.optimize()
       
+        # save model
+        model_id = (iMod_AA["iModulon"] + "; " + AA_syn).replace("/", "_")
+        cobra.io.save_json_model(model_p, "Models/" + model_id + ".json")
+        # max_growth_solutions[(iMod_AA["iModulon"] + "; " + AA_syn).replace("/", "_")]\
+        #     = model_p.copy()
+        
+        # test if auxotrophy of other AAs are lifted at the same time
+        aa_cosynth = {}
+        for amino_acid in AA_IDs:
+            if amino_acid != AA_syn[:-2] and amino_acid != "cys__L":
+                with model_p:
+                    # disable amino acid uptake
+                    model_p = disable_amino_acid_uptake(model_p, amino_acid)
+                    # optimize for growth
+                    sol_aa_syn = model_p.slim_optimize(error_value=-1)
+                    # is growth possible?
+                    if sol_aa_syn > 1e-2:
+                        aa_cosynth[amino_acid] = str(round(sol_aa_syn, 3))
+        
         
       
     # make extra sheet with additional information
@@ -446,28 +532,32 @@ for i, iMod_AA in iMod_res.iterrows():
                                       "Reaction ID",
                                       "Reaction name",
                                       "Genes",
-                                      "Reaction flux [mmol/gDW/h]",
-                                      "Reaction formula"
+                                      "Reaction flux (max yield) [mmol/gDW/h]",
+                                      "Reaction flux (max growth) [mmol/gDW/h]",
+                                      "Reaction formula",
                                      ])
     c = 0
         
     # update table 
     ecoli_rxns = []
     ecoli_subsystems = []
-    ecoli_genes = []
+    ecoli_genes_total = []
     ecoli_rxns_flux = []
     for r in essential_reactions[dict_key]:
         ecoli_id = r[:-len(id_prefix_ecoli)]
         # save reaction ID
         ecoli_rxns.append(ecoli_id)
         # save flux
-        ecoli_rxns_flux.append(str(sol.fluxes[r]))
+        ecoli_rxns_flux.append(str(sol_max_aa.fluxes[r]))
         # save subsystem
-        ecoli_subsystems.append(iML1515.reactions.get_by_id(ecoli_id).subsystem)
+        ecoli_subsystem = iML1515.reactions.get_by_id(ecoli_id).subsystem
+        ecoli_subsystems.append(ecoli_subsystem)
+        
         # save related genes
         ecoli_genes = []
         for g in iML1515.reactions.get_by_id(ecoli_id).genes:
             ecoli_genes.append(g.id)
+            ecoli_genes_total.append(g.id)
             
         # fill extra sheet
         # heterologous E. coli reactions
@@ -475,10 +565,27 @@ for i, iMod_AA in iMod_res.iterrows():
         iMod_info.loc[c, "Reaction ID"] = ecoli_id
         iMod_info.loc[c, "Reaction name"] = iML1515.reactions.get_by_id(ecoli_id).name
         iMod_info.loc[c, "Genes"] = ", ".join(list(np.unique(ecoli_genes)))
-        iMod_info.loc[c, "Reaction flux [mmol/gDW/h]"] = sol.fluxes[r]
+        iMod_info.loc[c, "Reaction flux (max yield) [mmol/gDW/h]"] = round(sol_max_aa.fluxes[r], 4)
+        iMod_info.loc[c, "Reaction flux (max growth) [mmol/gDW/h]"] = round(sol_max_mu.fluxes[r], 3)
         iMod_info.loc[c, "Reaction formula"] = iML1515.reactions.get_by_id(ecoli_id).build_reaction_string()
         c += 1
-      
+     
+        
+     
+    # update summary  
+    iMod_AA.loc["E. coli connect reactions"] = ", ".join(ecoli_rxns)
+    iMod_AA.loc["E. coli connect reaction fluxes"] = ", ".join(ecoli_rxns_flux)
+    iMod_AA.loc["E. coli connect subsystems"] = ", ".join(list(np.unique(ecoli_subsystems)))
+    iMod_AA.loc["E.coli connect genes"] = ", ".join(list(np.unique(ecoli_genes_total)))
+    iMod_AA.loc["Amino acid synthesis rate [mmol/gDW/h]"] = round(sol_max_aa.objective_value, 4)
+    iMod_AA.loc["Maximum growth rate [1/h]"] = round(sol_max_mu.objective_value, 3)
+    
+    # add co-synthesis of AAs
+    if len(aa_cosynth) > 0:
+        iMod_AA.loc["Amino acid co-synthesis"] = ", ".join(list(aa_cosynth.keys()))
+        iMod_AA.loc["Amino acid co-synthesis growth [1/h]"] = ", ".join(list(aa_cosynth.values()))
+        
+     
     # fill extra sheet with iModulon reaction data
     for r in iMod_rxns_unique:
         # get ID
@@ -492,18 +599,14 @@ for i, iMod_AA in iMod_res.iterrows():
         iMod_info.loc[c, "Reaction ID"] = ecoli_id
         iMod_info.loc[c, "Reaction name"] = iML1515.reactions.get_by_id(ecoli_id).name
         iMod_info.loc[c, "Genes"] = ", ".join(list(np.unique(ecoli_genes)))
-        iMod_info.loc[c, "Reaction flux [mmol/gDW/h]"] = sol.fluxes[r]
+        iMod_info.loc[c, "Reaction flux (max yield) [mmol/gDW/h]"] = round(sol_max_aa.fluxes[r], 4)
+        iMod_info.loc[c, "Reaction flux (max growth) [mmol/gDW/h]"] = round(sol_max_mu.fluxes[r], 3)
         iMod_info.loc[c, "Reaction formula"] = iML1515.reactions.get_by_id(ecoli_id).build_reaction_string()
         c += 1
         
       
     iMod_info_save[(iMod_AA["iModulon"] + "; " + AA_syn).replace("/", "_")] = iMod_info
                 
-    iMod_AA.loc["E. coli connect reactions"] = ", ".join(ecoli_rxns)
-    iMod_AA.loc["E. coli connect reaction fluxes"] = ", ".join(ecoli_rxns_flux)
-    iMod_AA.loc["E. coli connect subsystems"] = ", ".join(list(np.unique(ecoli_subsystems)))
-    iMod_AA.loc["E.coli connect genes"] = ", ".join(list(np.unique(ecoli_genes)))
-    iMod_AA.loc["Amino acid synthesis rate [mmol/gDW/h]"] = sol.objective_value
     
     
     
